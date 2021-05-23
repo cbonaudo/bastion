@@ -234,6 +234,10 @@ pub enum ActorRestartStrategy {
         /// Defines a multiplier how fast the timeout will be increasing.
         multiplier: f64,
     },
+    /// Restart an actor after the future provided yields.
+    UserCustomized {
+        restart_signaler: Box<dyn Future<Output = ()>>,
+    } 
 }
 
 impl ActorRestartStrategy {
@@ -2101,8 +2105,12 @@ impl RestartStrategy {
     }
 
     pub(crate) async fn apply_strategy(&self, restarts_count: usize) {
-        if let Some(dur) = self.strategy.calculate(restarts_count) {
-            Delay::new(dur).await;
+        if let ActorRestartStrategy::UserCustomized { restart_signaler } = self {
+            restart_signaler.await;
+        } else {
+            if let Some(dur) = self.strategy.calculate(restarts_count) {
+                Delay::new(dur).await;
+            }
         }
     }
 }
