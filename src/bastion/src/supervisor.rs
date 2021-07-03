@@ -11,6 +11,7 @@ use crate::message::{BastionMessage, Deployment, Message};
 use crate::path::{BastionPath, BastionPathElement};
 
 use bastion_executor::pool;
+use futures::future::BoxFuture;
 use futures::prelude::*;
 use futures::stream::FuturesOrdered;
 use futures::{pending, poll};
@@ -18,6 +19,7 @@ use futures_timer::Delay;
 use fxhash::FxHashMap;
 use lightproc::prelude::*;
 use std::cmp::{Eq, PartialEq};
+use std::fmt::Debug;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -234,6 +236,34 @@ pub enum ActorRestartStrategy {
         /// Defines a multiplier how fast the timeout will be increasing.
         multiplier: f64,
     },
+    /// Restart an actor after the future provided yields.
+    UserCustomized(UserCustomized),
+}
+
+pub type BeforeRestart<'a> = dyn Fn() -> BoxFuture<'a, Result<(), ()>> + Send + Sync;
+
+pub struct UserCustomized {
+    restart_signaler: Arc<BeforeRestart<'static>>,
+}
+
+impl Debug for UserCustomized {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserCustomized").finish()
+    }
+}
+
+impl Clone for UserCustomized {
+    fn clone(&self) -> Self {
+        UserCustomized {
+            restart_signaler: Arc::clone(&self.restart_signaler),
+        }
+    }
+}
+
+impl PartialEq for UserCustomized {
+    fn eq(&self, other: &Self) -> bool {
+        true
+    }
 }
 
 impl ActorRestartStrategy {
@@ -2101,8 +2131,15 @@ impl RestartStrategy {
     }
 
     pub(crate) async fn apply_strategy(&self, restarts_count: usize) {
-        if let Some(dur) = self.strategy.calculate(restarts_count) {
-            Delay::new(dur).await;
+        if let ActorRestartStrategy::UserCustomized(UserCustomized { restart_signaler }) =
+            &self.strategy
+        {
+            // TODO: err means don't restart, ok means restart now
+            restart_signaler().await;
+        } else {
+            if let Some(dur) = self.strategy.calculate(restarts_count) {
+                Delay::new(dur).await;
+            }
         }
     }
 }
@@ -2135,3 +2172,40 @@ impl PartialEq for SupervisorRef {
 }
 
 impl Eq for SupervisorRef {}
+
+#[cfg(test)]
+mod restart_strategy_tests {
+    use std::sync::Arc;
+
+    use futures_timer::Delay;
+
+    use crate::prelude::*;
+
+    use super::{BeforeRestart, UserCustomized};
+
+    #[test]
+    fn test_restart_strategy() {
+        let restart_signaler: Arc<BeforeRestart> = Arc::new(|| {
+            Box::pin(async {
+                Delay::new(std::time::Duration::from_millis(200)).await;
+                Ok(())
+            })
+        });
+
+        Bastion::init();
+        Bastion::supervisor(|sp| {
+            sp.with_restart_strategy(
+                RestartStrategy::default()
+                    .with_restart_policy(RestartPolicy::Tries(5))
+                    .with_actor_restart_strategy(ActorRestartStrategy::UserCustomized(
+                        UserCustomized { restart_signaler },
+                    )),
+            )
+        })
+        .expect("Couldn't create the supervisor");
+
+        Bastion::start();
+        Bastion::stop();
+        Bastion::block_until_stopped();
+    }
+}
